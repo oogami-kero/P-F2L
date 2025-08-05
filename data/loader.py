@@ -331,7 +331,7 @@ def data_to_nparray(data, stoi, vocab_size, max_text_len=None):
     for i in range(len(data)):
 
         text[i, :len(data[i]['text'])] = [
-                stoi[x] if x in stoi else stoi['unk']
+                stoi[x] if x in stoi else stoi['<unk>']
                 for x in data[i]['text']]
         #text[i, :len(data[i]['text'])] = stoi(data[i]['text'])
 
@@ -441,23 +441,16 @@ def load_dataset(datadir, dataset, args=None):
     vectors=GloVe(name='42B', dim=300)
     print(vectors)
 
-    # 1. Create an iterator that yields lists of tokens
-    def yield_tokens(data_iter):
-        for example in data_iter:
-            yield example['text']
-
-    # 2. Build the vocabulary using the new API
-    Vocab = build_vocab_from_iterator(
-        yield_tokens(all_data),
+    Vocab = vocab(
+        collections.Counter(_read_words(all_data)),
         specials=['<pad>', '<unk>'],
-        min_freq=5
+        min_freq=5,
     )
-    # 3. Set the default index for out-of-vocabulary words
-    Vocab.set_default_index(Vocab['<unk>'])
-    
-    # Vocab.insert_token('<pad>',32135)
+
     print('vocab size:', len(Vocab.get_stoi()))
-    Vocab.set_default_index(32137)
+    # use the index of <unk> token as default index
+    unk_index = Vocab.get_stoi()['<unk>']
+    Vocab.set_default_index(unk_index)
 
     print(len(vectors.stoi))
 
@@ -492,9 +485,9 @@ def load_dataset(datadir, dataset, args=None):
     else:
         max_text_len=44
 
-    train_data = data_to_nparray(train_data, vectors.stoi, wv_size[0], max_text_len=max_text_len)
-    val_data = data_to_nparray(val_data, vectors.stoi, wv_size[0], max_text_len=max_text_len)
-    test_data = data_to_nparray(test_data, vectors.stoi, wv_size[0], max_text_len=max_text_len)
+    train_data = data_to_nparray(train_data, Vocab.get_stoi(), wv_size[0], max_text_len=max_text_len)
+    val_data = data_to_nparray(val_data, Vocab.get_stoi(), wv_size[0], max_text_len=max_text_len)
+    test_data = data_to_nparray(test_data, Vocab.get_stoi(), wv_size[0], max_text_len=max_text_len)
 
     print(train_data['text'].shape)
 

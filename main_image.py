@@ -16,17 +16,13 @@ from sklearn import metrics
 from PIL import Image
 
 from model import *
+from model import WordEmbed
 from utils import *
-from dp_utils import compute_noisy_delta, compute_epsilon
+from opacus.accountants import RDPAccountant
 import warnings
+from data.class_mappings import fine_id_coarse_id, coarse_id_fine_id, coarse_split
 
 warnings.filterwarnings('ignore')
-
-fine_id_coarse_id = {0: 4, 1: 1, 2: 14, 3: 8, 4: 0, 5: 6, 6: 7, 7: 7, 8: 18, 9: 3, 10: 3, 11: 14, 12: 9, 13: 18, 14: 7, 15: 11, 16: 3, 17: 9, 18: 7, 19: 11, 20: 6, 21: 11, 22: 5, 23: 10, 24: 7, 25: 6, 26: 13, 27: 15, 28: 3, 29: 15, 30: 0, 31: 11, 32: 1, 33: 10, 34: 12, 35: 14, 36: 16, 37: 9, 38: 11, 39: 5, 40: 5, 41: 19, 42: 8, 43: 8, 44: 15, 45: 13, 46: 14, 47: 17, 48: 18, 49: 10, 50: 16, 51: 4, 52: 17, 53: 4, 54: 2, 55: 0, 56: 17, 57: 4, 58: 18, 59: 17, 60: 10, 61: 3, 62: 2, 63: 12, 64: 12, 65: 16, 66: 12, 67: 1, 68: 9, 69: 19, 70: 2, 71: 10, 72: 0, 73: 1, 74: 16, 75: 12, 76: 9, 77: 13, 78: 15, 79: 13, 80: 16, 81: 19, 82: 2, 83: 4, 84: 6, 85: 19, 86: 5, 87: 5, 88: 8, 89: 19, 90: 18, 91: 1, 92: 2, 93: 15, 94: 6, 95: 0, 96: 17, 97: 8, 98: 14, 99: 13}
-
-coarse_id_fine_id = {0: [4, 30, 55, 72, 95], 1: [1, 32, 67, 73, 91], 2: [54, 62, 70, 82, 92], 3: [9, 10, 16, 28, 61], 4: [0, 51, 53, 57, 83], 5: [22, 39, 40, 86, 87], 6: [5, 20, 25, 84, 94], 7: [6, 7, 14, 18, 24], 8: [3, 42, 43, 88, 97], 9: [12, 17, 37, 68, 76], 10: [23, 33, 49, 60, 71], 11: [15, 19, 21, 31, 38], 12: [34, 63, 64, 66, 75], 13: [26, 45, 77, 79, 99], 14: [2, 11, 35, 46, 98], 15: [27, 29, 44, 78, 93], 16: [36, 50, 65, 74, 80], 17: [47, 52, 56, 59, 96], 18: [8, 13, 48, 58, 90], 19: [41, 69, 81, 85, 89]}
-
-coarse_split={'train': [1,2, 3, 4, 5, 6, 9, 10, 15, 17, 18, 19], 'valid': [8, 11, 13, 16], 'test': [0, 7, 12, 14]}
 
 from collections import defaultdict
 
@@ -189,10 +185,13 @@ def get_args():
     parser.add_argument('--save_model',type=int,default=0)
     parser.add_argument('--use_project_head', type=int, default=1)
     parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
-    parser.add_argument('--use_transform_layer', type=int, default=1, help='toggle the per-client transform layer')
-    parser.add_argument('--clip_norm', type=float, default=1.0, help='max L2 norm for client update')
-    parser.add_argument('--noise_multiplier', type=float, default=0.0, help='noise multiplier for DP')
-    parser.add_argument('--dp_delta', type=float, default=1e-5, help='delta for DP accounting')
+    parser.add_argument('--use_transform_layer', type=int, default=0,
+                        help='enable personalized transformation layer')
+    parser.add_argument('--use_dp', type=int, default=0, help='enable DP-SGD')
+    parser.add_argument('--dp_clip', type=float, default=1.0, help='DP-SGD clipping norm')
+    parser.add_argument('--dp_noise', type=float, default=0.0, help='DP-SGD noise multiplier')
+    parser.add_argument('--dp_delta', type=float, default=1e-5, help='target delta for DP accountant')
+    parser.add_argument('--print_eps', type=int, default=0, help='print final privacy budget')
     args = parser.parse_args()
     return args
 
@@ -235,12 +234,12 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
         
     if args.mode=='few-shot' and args.method=='new':
         if args.dataset=='20newsgroup':
-            ebd=WORDEBD(args.finetune_ebd)
+            ebd=WordEmbed(args.finetune_ebd)
         for net_i in range(n_parties):
             if args.dataset=='FC100' or args.dataset=='miniImageNet':
                 net = ModelFed_Adp(args.model, args.out_dim, n_classes, total_classes, net_configs, args)
             else:
-                net = LSTMAtt(WORDEBD(args.finetune_ebd), args.out_dim, n_classes, total_classes,args)
+                net = LSTMAtt(WordEmbed(args.finetune_ebd), args.out_dim, n_classes, total_classes,args)
             if device == 'cpu':
                 net.to(device)
             else:
@@ -257,8 +256,8 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
     return nets, model_meta_data, layer_type
 
 
-def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_train_client,y_train_client, X_test, y_test,
-                                        device='cpu', test_only=False, test_only_k=0):
+def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_train_client, y_train_client, X_test, y_test,
+                                        device='cpu', accountant=None, test_only=False, test_only_k=0):
     #net = nn.DataParallel(net)
     #net=nn.parallel.DistributedDataParallel(net)
     #net.cuda()
@@ -285,6 +284,7 @@ def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_tra
         )
     loss_ce = nn.CrossEntropyLoss()
     loss_mse = nn.MSELoss()
+    client_sample_size = X_train_client.shape[0]
 
     def train_epoch(epoch, mode='train'):
         nonlocal optimizer
@@ -350,6 +350,10 @@ def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_tra
 
         if test_only==True:
             K=test_only_k
+
+        support_batch = N * K
+        query_batch = N * Q
+        total_batch = support_batch + query_batch
 
         support_labels = torch.zeros(N * K, dtype=torch.long)
         for i in range(N):
@@ -472,25 +476,46 @@ def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_tra
 
                 for j in range(args.fine_tune_steps):
                     X_out_sup, X_transformer_out_sup, out = net_new(X_total_sup)
-                    loss = loss_ce(out, support_labels)
-                    #loss+=loss_ce(out, out_sup_on_N_class)
-                    #loss+=loss_mse(out_sup_on_N_class.softmax(-1),out.softmax(-1))
+                    losses = F.cross_entropy(out, support_labels, reduction='none')
 
                     net_para = net_new.state_dict()
                     param_require_grad = {}
                     for key, param in net_new.named_parameters():
                         if key == 'few_classify.weight' or key == 'few_classify.bias':
-                            # if key !='all_classify.weight' and key !='all_classify.bias':
                             if param.requires_grad:
                                 param_require_grad[key] = param
-                    grad = torch.autograd.grad(loss, param_require_grad.values(), allow_unused=True)
-                    for key, grad_ in zip(param_require_grad.keys(), grad):
-                        if grad_ == None: continue
-                        net_para[key] = net_para[key] - args.fine_tune_lr * grad_
+
+                    if args.use_dp:
+                        per_sample_grads = []
+                        for i in range(losses.size(0)):
+                            grad_i = torch.autograd.grad(losses[i], param_require_grad.values(), retain_graph=True, allow_unused=True)
+                            per_sample_grads.append(grad_i)
+                        per_param_grads = []
+                        params_list = list(param_require_grad.values())
+                        for idx in range(len(params_list)):
+                            grads = []
+                            for g in per_sample_grads:
+                                grads.append(g[idx] if g[idx] is not None else torch.zeros_like(params_list[idx]))
+                            per_param_grads.append(torch.stack(grads))
+                        dp_grads = dp_clip_and_noise(per_param_grads, args.dp_clip, args.dp_noise)
+                        for key, grad_ in zip(param_require_grad.keys(), dp_grads):
+                            net_para[key] = net_para[key] - args.fine_tune_lr * grad_
+                    else:
+                        loss = losses.mean()
+                        grad = torch.autograd.grad(loss, param_require_grad.values(), allow_unused=True)
+                        for key, grad_ in zip(param_require_grad.keys(), grad):
+                            if grad_ is None:
+                                continue
+                            net_para[key] = net_para[key] - args.fine_tune_lr * grad_
                     # net_para = list(
                     #                map(lambda p: p[1] - fine_tune_lr * p[0], zip(grad, net_para)))
                     # net_para={key:value for key, value in zip(net.state_dict().keys(),net.state_dict().values())}
                     net_new.load_state_dict(net_para)
+                    if accountant is not None:
+                        accountant.step(
+                            noise_multiplier=args.dp_noise,
+                            sample_rate=support_batch / client_sample_size,
+                        )
 
                 X_out_query, _, out = net_new(X_total_query)
                 X_out_sup, X_transformer_out_sup, _ = net_new(X_total_sup)
@@ -504,7 +529,18 @@ def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_tra
                     loss_all += contras_loss / Q * 0.1
                 loss_all += loss_ce(out_all, y_total)
                 loss_all.backward()
+                if args.use_dp:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), args.dp_clip)
+                    for p in net.parameters():
+                        if p.grad is not None:
+                            noise = torch.randn_like(p.grad) * args.dp_noise * args.dp_clip / total_batch
+                            p.grad.add_(noise)
                 optimizer.step()
+                if accountant is not None:
+                    accountant.step(
+                        noise_multiplier=args.dp_noise,
+                        sample_rate=total_batch / client_sample_size,
+                    )
                 ############################
 
                 X_out_all, x_all, out_all = net(torch.cat([X_total_sup, X_total_query], 0), all_classify=True)
@@ -519,14 +555,37 @@ def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_tra
                         param_require_grad[key]=param
 
                 #meta-update few-classifier on query
-                loss = loss_ce(out, query_labels)
+                losses = F.cross_entropy(out, query_labels, reduction='none')
                 out_sup_on_N_class = out_all[N * K:, transformed_class_list]
                 out_sup_on_N_class/=out_sup_on_N_class.sum(-1,keepdim=True)
-                loss+=loss_ce(out,out_sup_on_N_class)*0.1
-                grad = torch.autograd.grad(loss, param_require_grad.values())
-                for key, grad_ in zip(param_require_grad.keys(), grad):
-                    net_para_ori[key]=net_para_ori[key]-args.meta_lr*grad_
+                aux_loss = F.cross_entropy(out, out_sup_on_N_class.detach(), reduction='none') * 0.1
+                losses = losses + aux_loss
+                if args.use_dp:
+                    per_sample_grads = []
+                    for i in range(losses.size(0)):
+                        grad_i = torch.autograd.grad(losses[i], param_require_grad.values(), retain_graph=True, allow_unused=True)
+                        per_sample_grads.append(grad_i)
+                    per_param_grads = []
+                    params_list = list(param_require_grad.values())
+                    for idx in range(len(params_list)):
+                        grads = []
+                        for g in per_sample_grads:
+                            grads.append(g[idx] if g[idx] is not None else torch.zeros_like(params_list[idx]))
+                        per_param_grads.append(torch.stack(grads))
+                    dp_grads = dp_clip_and_noise(per_param_grads, args.dp_clip, args.dp_noise)
+                    for key, grad_ in zip(param_require_grad.keys(), dp_grads):
+                        net_para_ori[key]=net_para_ori[key]-args.meta_lr*grad_
+                else:
+                    loss = losses.mean()
+                    grad = torch.autograd.grad(loss, param_require_grad.values())
+                    for key, grad_ in zip(param_require_grad.keys(), grad):
+                        net_para_ori[key]=net_para_ori[key]-args.meta_lr*grad_
                 net.load_state_dict(net_para_ori)
+                if accountant is not None:
+                    accountant.step(
+                        noise_multiplier=args.dp_noise,
+                        sample_rate=query_batch / client_sample_size,
+                    )
                 ##################################
                 del net_new,X_out_query, out
 
@@ -603,8 +662,8 @@ def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_tra
         for epoch in range(args.num_train_tasks):
             accs_train.append(train_epoch(epoch))
             if np.random.rand() < 0.05:
-                logger.info("Meta-train_Accuracy: {:.4f}".format(np.mean(accs_train)))
-                print("Meta-train_Accuracy: {:.4f}".format(np.mean(accs_train)))
+                logger.info('Meta-train_Accuracy: {:.4f}'.format(np.mean(accs_train)))
+                print('Meta-train_Accuracy: {:.4f}'.format(np.mean(accs_train)))
 
 
         accs=[]
@@ -638,7 +697,7 @@ def train_net_few_shot_new(net_id, net, n_epoch, lr, args_optimizer, args, X_tra
     return  np.mean(accs)
 
 
-def local_train_net_few_shot(nets, args, net_dataidx_map, X_train, y_train, X_test, y_test, device="cpu", test_only=False, test_only_k=0):
+def local_train_net_few_shot(nets, args, net_dataidx_map, X_train, y_train, X_test, y_test, device='cpu', accountant=None, test_only=False, test_only_k=0):
     avg_acc = 0.0
     acc_list = []
     max_value_all_clients=[]
@@ -669,12 +728,12 @@ def local_train_net_few_shot(nets, args, net_dataidx_map, X_train, y_train, X_te
 
 
         if test_only==False:
-            testacc = train_net_few_shot_new(net_id, net, n_epoch, args.lr, args.optimizer, args, X_train_client,y_train_client,X_test, y_test,
-                                        device=device, test_only=False)
+            testacc = train_net_few_shot_new(net_id, net, n_epoch, args.lr, args.optimizer, args, X_train_client, y_train_client, X_test, y_test,
+                                        device=device, accountant=accountant, test_only=False)
         else:
             #np.random.seed(1)
-            testacc, max_values, indices=train_net_few_shot_new(net_id, net, n_epoch, args.lr, args.optimizer, args, X_train_client,y_train_client,X_test, y_test,
-                                        device=device, test_only=True, test_only_k=test_only_k)
+            testacc, max_values, indices=train_net_few_shot_new(net_id, net, n_epoch, args.lr, args.optimizer, args, X_train_client, y_train_client, X_test, y_test,
+                                        device=device, accountant=accountant, test_only=True, test_only_k=test_only_k)
             max_value_all_clients.append(max_values)
             indices_all_clients.append(indices)
             #np.random.seed(int(time.time()))
@@ -801,6 +860,10 @@ if __name__ == '__main__':
     K=args.K
     Q=args.Q
 
+    accountant = None
+    if args.use_dp:
+        accountant = RDPAccountant()
+
     support_labels=torch.zeros(N*K,dtype=torch.long)
     for i in range(N):
         support_labels[i * K:(i + 1) * K] = i
@@ -855,30 +918,26 @@ if __name__ == '__main__':
                 old_w = copy.deepcopy(global_model.state_dict())
 
             nets_this_round = {k: nets[k] for k in party_list_this_round}
+            participating_ids = list(nets_this_round.keys())
 
-            total_data_points = sum(len(net_dataidx_map[r]) for r in range(args.n_parties))
-            fed_avg_freqs = {r: len(net_dataidx_map[r]) / total_data_points for r in range(args.n_parties)}
-            
-            for net_id, net in nets_this_round.items():
+            total_data_points = sum(len(net_dataidx_map[r]) for r in participating_ids)
+
+            for client_id in participating_ids:
+                net = nets_this_round[client_id]
                 if use_minus:
                     net_para = net.state_dict()
                     for key in net_para:
-                        net_para[key]=(global_w[key]*total_data_points-net_para[key]*len(net_dataidx_map[net_id]))/(total_data_points+1e-9-len(net_dataidx_map[net_id]))    
+                        net_para[key] = (global_w[key] * total_data_points - net_para[key] * len(net_dataidx_map[client_id])) / (total_data_points + 1e-9 - len(net_dataidx_map[client_id]))
                     net.load_state_dict(net_para)
                 else:
                     net_para = net.state_dict()
                     for key in net_para:
-                        if (
-                            key != 'few_classify.weight'
-                            and key != 'few_classify.bias'
-                            and 'transformer' not in key
-                            and 'transform_layer' not in key
-                        ):
+                        if key != 'few_classify.weight' and key != 'few_classify.bias' and 'transformer' not in key and 'transform_layer' not in key:
                             net_para[key] = global_w[key]
                     net.load_state_dict(net_para)
 
             for k in [1,5]:
-                global_acc, max_value_all_clients, indices_all_clients=local_train_net_few_shot(nets_this_round, args, net_dataidx_map, X_train, y_train, X_test, y_test, device=device, test_only=True, test_only_k=k)
+                global_acc, max_value_all_clients, indices_all_clients=local_train_net_few_shot(nets_this_round, args, net_dataidx_map, X_train, y_train, X_test, y_test, device=device, accountant=accountant, test_only=True, test_only_k=k)
                 global_acc = max(global_acc)
                 if k==1:
                     if global_acc > best_acc:
@@ -894,46 +953,24 @@ if __name__ == '__main__':
                         '>> Global 5 Model Test accuracy: {:.4f} Best Acc: {:.4f} '.format(global_acc, best_acc_5))
 
 
-            local_train_net_few_shot(nets_this_round, args, net_dataidx_map, X_train, y_train, X_test, y_test, device=device)
+            local_train_net_few_shot(nets_this_round, args, net_dataidx_map, X_train, y_train, X_test, y_test, device=device, accountant=accountant)
 
-            deltas = {}
-            for nid, net in nets_this_round.items():
-                local_params = net.state_dict()
-                noisy_delta, delta_before = compute_noisy_delta(global_w, local_params, args.clip_norm, args.noise_multiplier)
-                sample_before = next(iter(delta_before.values())).view(-1)[:3].cpu()
-                sample_after = next(iter(noisy_delta.values())).view(-1)[:3].cpu()
-                print(f"Delta sample client {nid}: {sample_before.tolist()} -> {sample_after.tolist()}")
-                deltas[nid] = noisy_delta
-            # Each client's update is noised once per round, so count the number
-            # of participating clients rather than local epochs
-            dp_steps += len(nets_this_round)
-            eps = compute_epsilon(
-                dp_steps,
-                args.noise_multiplier,
-                args.dp_delta,
-                accountant="rdp",
-                sampling_rate=args.sample_fraction,
-            )
-            print(f"Approx DP epsilon after {round+1} rounds: {eps:.4f}")
+            total_data_points = sum(len(net_dataidx_map[r]) for r in participating_ids)
+            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in participating_ids]
 
-            # Aggregate only shared parameters; classifier weights stay private
-            global_update = {
-                k: torch.zeros_like(v)
-                for k, v in global_w.items()
-                if (
-                    torch.is_floating_point(v)
-                    and not k.startswith("transform_layer.")
-                    and k != "few_classify.weight"
-                    and k != "few_classify.bias"
-                )
-            }
-            for nid, delta in deltas.items():
-                weight = fed_avg_freqs[nid]
-                for key in delta:
-                    global_update[key] += delta[key] * weight
-
-            for key in global_update:
-                global_w[key] += global_update[key]
+            for net_id, client_id in enumerate(participating_ids):
+                net = nets_this_round[client_id]
+                net_para = net.state_dict()
+                if net_id == 0:
+                    for key in net_para:
+                        if 'transform_layer' in key:
+                            continue
+                        global_w[key] = net_para[key] * fed_avg_freqs[net_id]
+                else:
+                    for key in net_para:
+                        if 'transform_layer' in key:
+                            continue
+                        global_w[key] += net_para[key] * fed_avg_freqs[net_id]
 
             if args.server_momentum:
                 delta_w = copy.deepcopy(global_w)
@@ -955,3 +992,7 @@ if __name__ == '__main__':
             if global_acc > best_acc:
                 torch.save(global_model.state_dict(), args.modeldir+'fedavg/'+'globalmodel'+args.log_file_name+'.pth')
                 torch.save(nets[0].state_dict(), args.modeldir+'fedavg/'+'localmodel0'+args.log_file_name+'.pth')
+            if accountant is not None and args.print_eps:
+                eps = accountant.get_epsilon(delta=args.dp_delta)
+                print('Current epsilon {:.4f}, delta {:.1e}'.format(eps, args.dp_delta))
+                logger.info('Current epsilon {:.4f}, delta {:.1e}'.format(eps, args.dp_delta))

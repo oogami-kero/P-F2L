@@ -18,20 +18,16 @@ def l2_normalize(x):
 
 
 class TransformLayer(nn.Module):
-    """Per-client affine transform layer from PrivateFL."""
-    def __init__(self, num_features):
+    """Per-client data transformation layer T_k(x) = alpha * x + beta."""
+
+    def __init__(self, channels=3):
         super().__init__()
-        self.alpha = nn.Parameter(torch.ones(num_features))
-        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.alpha = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x):
-        if x.dim() == 4:
-            a = self.alpha.view(1, -1, 1, 1)
-            b = self.beta.view(1, -1, 1, 1)
-        else:
-            a = self.alpha.view(1, -1)
-            b = self.beta.view(1, -1)
-        return a * x + b
+        return self.alpha * x + self.beta
+
 
 class DropBlock(nn.Module):
     def __init__(self, block_size):
@@ -866,11 +862,11 @@ class ModelFed_Adp(nn.Module):
     def __init__(self, base_model, out_dim, n_classes, total_classes, net_configs=None, args=None):
         super(ModelFed_Adp, self).__init__()
 
-        in_channels = 1 if args.dataset in {'femnist', 'emnist', 'xray'} else 3
-        if getattr(args, 'use_transform_layer', 1):
-            self.transform_layer = TransformLayer(in_channels)
+        self.use_transform = getattr(args, "use_transform_layer", 0)
+        if self.use_transform:
+            self.transform_layer = TransformLayer(channels=3)
         else:
-            self.transform_layer = nn.Identity()
+            self.transform_layer = None
 
         if base_model == "resnet50-cifar10" or base_model == "resnet50-cifar100" or base_model == "resnet50-smallkernel" or base_model == "resnet50":
             basemodel = ResNet50_cifar10()
@@ -926,8 +922,9 @@ class ModelFed_Adp(nn.Module):
             raise ("Invalid model name. Check the config file and pass one of: resnet18 or resnet50")
 
     def forward(self, x_ori, all_classify=False):
-        x_trans = self.transform_layer(x_ori)
-        h = self.features(x_trans)
+        if self.transform_layer is not None:
+            x_ori = self.transform_layer(x_ori)
+        h = self.features(x_ori)
 
         # print("h before:", h)
         # print("h size:", h.size())
@@ -948,14 +945,14 @@ class ModelFed_Adp(nn.Module):
         return ebd, x, y
 
 
-class WORDEBD(nn.Module):
+class WordEmbed(nn.Module):
     '''
         An embedding layer that maps the token id into its corresponding word
         embeddings. The word embeddings are kept as fixed once initialized.
     '''
 
     def __init__(self, finetune_ebd):
-        super(WORDEBD, self).__init__()
+        super(WordEmbed, self).__init__()
         #vectors = Vectors('wiki.en.vec', cache='./')
         vectors = GloVe(name='42B', dim=300)
 
@@ -989,7 +986,7 @@ class LSTMAtt(nn.Module):
     def __init__(self, ebd, out_dim, n_classes, total_classes, args=None):
         super(LSTMAtt, self).__init__()
 
-        # ebd = WORDEBD(args.finetune_ebd)
+        # ebd = WordEmbed(args.finetune_ebd)
 
         self.args = args
         if args.dataset=='20newsgroup':
@@ -1029,10 +1026,8 @@ class LSTMAtt(nn.Module):
 
         self.all_classify = nn.Linear(out_dim, total_classes)
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=self.ebd_dim, nhead=4)
-        self.transformer= nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=1)
-
-        print(self.state_dict().keys())
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.ebd_dim, nhead=4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=1)
 
 
 
@@ -1089,23 +1084,14 @@ class LSTMAtt(nn.Module):
 
         # aggregate
         ebd = torch.sum(ebd * alpha.unsqueeze(-1), dim=1)
-        #ebd = ebd.mean(1)
 
-        #x=F.dropout(ebd, p=0.5,training=self.training)
-
-
-        #x = self.l1(ebd)
-        #x = F.relu(x)
-        #x = self.l2(x)
-
-
+        x = self.transformer(ebd.unsqueeze(1)).squeeze(1)
+        x = self.l1(x)
+        x = F.relu(x)
+        x = self.l2(x)
         if not all_classify:
-            x=self.transformer(ebd)
             y = self.few_classify(x)
         else:
-            x = self.l1(ebd)
-            x = F.relu(x)
-            x = self.l2(x)
             y = self.all_classify(x)
         return ebd, x, y
 
